@@ -100,7 +100,7 @@ class VirtualMachine:
     def popn(self, n):
         # 弹出多个值
         if n:
-            ret = self.frame.stack(-n:)
+            ret = self.frame.stack[-n:]
             self.frame.stack[-n:] = []
             return ret
         else:
@@ -113,8 +113,8 @@ class VirtualMachine:
         byteCode = ord(f.code_obj.co_code[opoffset])
         f.last_instruction += 1
         # 指令名称
-        byte_name = dis.opname(byteCode)
-        # 指令码<dic.HAVE_ARGUMENT的都是无参数指令,其他则是有参数指令
+        byte_name = dis.opname[byteCode]
+        # 指令码小于dic.HAVE_ARGUMENT的都是无参数指令,其他则是有参数指令
         if byteCode >= dis.HAVE_ARGUMENT:
             # 取得后两字节的参数
             arg = f.code_obj.co_code[f.last_instruction: f.last_instruction+2]
@@ -179,6 +179,227 @@ class VirtualMachine:
             traceback, value, exctype = self.popn(3)
             self.last_exception = exctype, value, traceback
 
+    def manage_block_stack(self, why):
+        """管理一个frame的block栈,在循环,异常处理,返回这几方面操作block栈与数据栈"""
+        frame = self.frame
+        block = frame.block_stack[-1]
+        if block.type == 'loop' and why == 'continue':
+            self.jump(self.return_value)
+            why = None
+            return why
+        self.pop_block()
+        self.unwind_block(block)
+
+        if (block.type in ['setup_except', 'finally'] and why == 'exception'):
+            self.push_block('except_handler')
+            exctype, value, tb = self.last_exception
+            self.push(tb, value, exctype)
+            self.push(tb, value, exctype)
+            why = None
+            self.jump(block.handler)
+            return why
+        elif block.type == 'finally':
+            if why in ('return', 'continue'):
+                self.push(self.return_value)
+
+            self.push(why)
+
+            why = None
+            self.jump(block.handler)
+            return why
+        return why
+
+    ## Stack manipulation
+
+    def byte_LOAD_CONST(self, const):
+        self.push(const)
+
+    def byte_POP_TOP(self):
+        self.pop()
+
+    ## Names
+    def byte_LOAD_NAME(self, name):
+        frame = self.frame
+        if name in frame.f_locals:
+            val = frame.f_locals[name]
+        elif name in frame.f_globals:
+            val = frame.f_globals[name]
+        elif name in frame.f_builtins:
+            val = frame.f_builtins[name]
+        else:
+            raise NameError("name '%s' is not defined" % name)
+        self.push(val)
+
+    def byte_STORE_NAME(self, name):
+        self.frame.f_locals[name] = self.pop()
+
+    def byte_LOAD_FAST(self, name):
+        if name in self.frame.f_locals:
+            val = self.frame.f_locals[name]
+        else:
+            raise UnboundLocalError(
+                "local variable '%s' referenced before assignment" % name
+            )
+        self.push(val)
+
+    def byte_STORE_FAST(self, name):
+        self.frame.f_locals[name] = self.pop()
+
+    def byte_LOAD_GLOBAL(self, name):
+        f = self.frame
+        if name in f.f_globals:
+            val = f.f_globals[name]
+        elif name in f.f_builtins:
+            val = f.f_builtins[name]
+        else:
+            raise NameError("global name '%s' is not defined" % name)
+        self.push(val)
+
+    ## Operators
+
+    BINARY_OPERATORS = {
+        'POWER':    pow,
+        'MULTIPLY': operator.mul,
+        'FLOOR_DIVIDE': operator.floordiv,
+        'TRUE_DIVIDE':  operator.truediv,
+        'MODULO':   operator.mod,
+        'ADD':      operator.add,
+        'SUBTRACT': operator.sub,
+        'SUBSCR':   operator.getitem,
+        'LSHIFT':   operator.lshift,
+        'RSHIFT':   operator.rshift,
+        'AND':      operator.and_,
+        'XOR':      operator.xor,
+        'OR':       operator.or_,
+    }
+
+    def binaryOperator(self, op):
+        x, y = self.popn(2)
+        self.push(self.BINARY_OPERATORS[op](x, y))
+
+    COMPARE_OPERATORS = [
+        operator.lt,
+        operator.le,
+        operator.eq,
+        operator.ne,
+        operator.gt,
+        operator.ge,
+        lambda x, y: x in y,
+        lambda x, y: x not in y,
+        lambda x, y: x is y,
+        lambda x, y: x is not y,
+        lambda x, y: issubclass(x, Exception) and issubclass(x, y),
+    ]
+
+    def byte_COMPARE_OP(self, opnum):
+        x, y = self.popn(2)
+        self.push(self.COMPARE_OPERATORS[opnum](x, y))
+
+    ## Attributes and indexing
+
+    def byte_LOAD_ATTR(self, attr):
+        obj = self.pop()
+        val = getattr(obj, attr)
+        self.push(val)
+
+    def byte_STORE_ATTR(self, name):
+        val, obj = self.popn(2)
+        setattr(obj, name, val)
+
+    ## Building
+
+    def byte_BUILD_LIST(self, count):
+        elts = self.popn(count)
+        self.push(elts)
+
+    def byte_BUILD_MAP(self, size):
+        self.push({})
+
+    def byte_STORE_MAP(self):
+        the_map, val, key = self.popn(3)
+        the_map[key] = val
+        self.push(the_map)
+
+    def byte_LIST_APPEND(self, count):
+        val = self.pop()
+        the_list = self.frame.stack[-count] # peek
+        the_list.append(val)
+
+    ## Jumps
+
+    def byte_JUMP_FORWARD(self, jump):
+        self.jump(jump)
+
+    def byte_JUMP_ABSOLUTE(self, jump):
+        self.jump(jump)
+
+    def byte_POP_JUMP_IF_TRUE(self, jump):
+        val = self.pop()
+        if val:
+            self.jump(jump)
+
+    def byte_POP_JUMP_IF_FALSE(self, jump):
+        val = self.pop()
+        if not val:
+            self.jump(jump)
+
+    def jump(self, jump):
+        self.frame.last_instruction = jump
+
+    ## Blocks
+
+    def byte_SETUP_LOOP(self, dest):
+        self.push_block('loop', dest)
+
+    def byte_GET_ITER(self):
+        self.push(iter(self.pop()))
+
+    def byte_FOR_ITER(self, jump):
+        iterobj = self.top()
+        try:
+            v = next(iterobj)
+            self.push(v)
+        except StopIteration:
+            self.pop()
+            self.jump(jump)
+
+    def byte_BREAK_LOOP(self):
+        return 'break'
+
+    def byte_POP_BLOCK(self):
+        self.pop_block()
+
+    ## Functions
+
+    def byte_MAKE_FUNCTION(self, argc):
+        name = None
+        code = self.pop()
+        defaults = self.popn(argc)
+        globs = self.frame.f_globals
+        fn = Function(name, code, globs, defaults, None, self)
+        self.push(fn)
+
+    def byte_CALL_FUNCTION(self, arg):
+        lenKw, lenPos = divmod(arg, 256) # KWargs not supported here
+        posargs = self.popn(lenPos)
+
+        func = self.pop()
+        frame = self.frame
+        retval = func(*posargs)
+        self.push(retval)
+
+    def byte_RETURN_VALUE(self):
+        self.return_value = self.pop()
+        return "return"
+
+    ## Prints
+
+    def byte_PRINT_ITEM(self):
+        item = self.pop()
+        sys.stdout.write(str(item))
+
+    def byte_PRINT_NEWLINE(self):
+        print ""   
 
 
 class Frame:
@@ -246,3 +467,21 @@ def make_cell(value):
     """创建一个真实的cell对象"""
     fn = (lambda x: lambda:x)(value)
     return fn.__closure__[0]
+
+
+if __name__ == '__main__':
+    code = """
+def loop():
+    x = 1
+    while x < 5:
+        if x==3:
+            break
+        x = x + 1
+        print x
+    return x
+loop()
+    """
+    #compile能够将源代码编译成字节码
+    code_obj = compile(code, "tmp", "exec")
+    vm = VirtualMachine()
+    vm.run_code(code_obj)
