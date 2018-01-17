@@ -162,18 +162,20 @@ class Templite:
         raise TempliteSyntaxError('{0}: {1!r}'.format(msg, thing))
 
     def _variable(self, name, vars_set):
-        """将变量存入指定的变量集中,同时验证变量名的有效性"""
+        """将变量存入变量集vars_set中,同时验证变量名的有效性"""
         if not re.match('[_a-zA-Z][_a-zA-Z0-9]', name):
             self._syntax_error("Not a valid name", name)
         vars_set.add(name)
 
     def render(self, context=None):
+        """使用'context'渲染该模板.'context'是在渲染时使用的值的字典"""
         render_context = dict(self.context)
         if context:
             render_context.update(context)
         return self._render_function(render_context, self._do_dots)
 
     def _do_dots(self, value, *dots):
+        """在运行时解析点表达式"""
         for dot in dots:
             try:
                 value = getattr(value, dot)
